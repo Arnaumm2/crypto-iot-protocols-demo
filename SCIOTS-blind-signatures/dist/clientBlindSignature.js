@@ -1,11 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
 import { gcd, modPow, modInv } from "bigint-crypto-utils";
+import { CoapClient as coap } from "node-coap-client";
 import { RsaPublicKey } from "./rsa.js";
-const BLIND_SERVER_URL = "http://localhost:3002";
+// Reverse proxy CoAP -> HTTP
+const COAP_HOST = "172.29.183.52";
+const COAP_PORT = 5683;
+const COAP_BASE_URL = `coap://${COAP_HOST}:${COAP_PORT}`;
 function hashMessageToBigInt(message) {
-    const hashHex = createHash("sha256")
-        .update(message)
-        .digest("hex");
+    const hashHex = createHash("sha256").update(message).digest("hex");
     return BigInt(`0x${hashHex}`);
 }
 function generateBlindingFactor(n) {
@@ -16,16 +18,30 @@ function generateBlindingFactor(n) {
     } while (r <= 1n || gcd(r, n) !== 1n);
     return r;
 }
+async function coapGetJson(path) {
+    const response = await coap.request(`${COAP_BASE_URL}${path}`, "get", undefined, { keepAlive: false });
+    const text = response.payload?.toString("utf8") ?? "";
+    console.log("CoAP response code:", response.code);
+    console.log("CoAP raw payload:", text);
+    if (!text) {
+        throw new Error(`Resposta CoAP buida a GET ${path}`);
+    }
+    return JSON.parse(text);
+}
+async function coapPostJson(path, body) {
+    const payload = Buffer.from(JSON.stringify(body), "utf8");
+    const response = await coap.request(`${COAP_BASE_URL}${path}`, "post", payload, { keepAlive: false });
+    if (!response.payload) {
+        throw new Error(`Resposta CoAP buida a POST ${path}`);
+    }
+    return JSON.parse(response.payload.toString("utf8"));
+}
 const main = async () => {
     try {
-        // 1. Obtenir la clau pública del servidor
-        const pubKeyResponse = await fetch(`${BLIND_SERVER_URL}/pubKey`);
-        if (!pubKeyResponse.ok) {
-            throw new Error("No s'ha pogut obtenir la clau pública.");
-        }
-        const pubKeyData = await pubKeyResponse.json();
+        // 1. Obtenir la clau pública del servidor via CoAP proxy
+        const pubKeyData = await coapGetJson("/pubKey");
         const publicKey = new RsaPublicKey(BigInt(pubKeyData.n), BigInt(pubKeyData.e));
-        console.log("Clau pública rebuda correctament.");
+        console.log("Clau pública rebuda correctament via CoAP.");
         // 2. Missatge que el client vol que el servidor signi
         const originalMessage = "Aquest és el meu missatge secret";
         // 3. El convertim a un nombre amb SHA-256
@@ -39,20 +55,10 @@ const main = async () => {
         const rPowE = modPow(r, publicKey.e, publicKey.n);
         const blindedMessage = (messageHash * rPowE) % publicKey.n;
         console.log("Missatge cegat:", blindedMessage.toString());
-        // 6. Enviem el missatge cegat al servidor perquè el signi
-        const blindSignResponse = await fetch(`${BLIND_SERVER_URL}/blind-sign`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                blindedMessage: blindedMessage.toString(),
-            }),
+        // 6. Enviem el missatge cegat al servidor via CoAP proxy
+        const blindSignData = await coapPostJson("/blind-sign", {
+            blindedMessage: blindedMessage.toString(),
         });
-        if (!blindSignResponse.ok) {
-            throw new Error("Error demanant la blind signature.");
-        }
-        const blindSignData = await blindSignResponse.json();
         const blindSignature = BigInt(blindSignData.blindSignature);
         console.log("Blind signature rebuda:", blindSignature.toString());
         // 7. Desceguem la signatura:
@@ -69,6 +75,9 @@ const main = async () => {
     }
     catch (error) {
         console.error("Error al client de blind signatures:", error);
+    }
+    finally {
+        coap.reset();
     }
 };
 main();

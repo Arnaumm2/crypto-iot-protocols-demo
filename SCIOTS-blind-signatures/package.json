@@ -15,7 +15,8 @@
   "dependencies": {
     "bigint-crypto-utils": "^3.3.0",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "node-coap-client": "^3.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

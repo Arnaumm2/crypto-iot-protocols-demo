@@ -1,13 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
 import { gcd, modPow, modInv } from "bigint-crypto-utils";
+import { CoapClient as coap } from "node-coap-client";
 import { RsaPublicKey } from "./rsa.js";
 
-const BLIND_SERVER_URL = "http://localhost:3002";
+// Reverse proxy CoAP -> HTTP
+const COAP_HOST = "172.29.183.52";
+const COAP_PORT = 5683;
+const COAP_BASE_URL = `coap://${COAP_HOST}:${COAP_PORT}`;
 
 function hashMessageToBigInt(message: string): bigint {
-  const hashHex = createHash("sha256")
-    .update(message)
-    .digest("hex");
+  const hashHex = createHash("sha256").update(message).digest("hex");
 
   return BigInt(`0x${hashHex}`);
 }
@@ -23,23 +25,54 @@ function generateBlindingFactor(n: bigint): bigint {
   return r;
 }
 
+async function coapGetJson<T>(path: string): Promise<T> {
+  const response = await coap.request(
+    `${COAP_BASE_URL}${path}`,
+    "get",
+    undefined,
+    { keepAlive: false },
+  );
+
+  const text = response.payload?.toString("utf8") ?? "";
+
+  console.log("CoAP response code:", response.code);
+  console.log("CoAP raw payload:", text);
+
+  if (!text) {
+    throw new Error(`Resposta CoAP buida a GET ${path}`);
+  }
+
+  return JSON.parse(text) as T;
+}
+
+async function coapPostJson<T>(path: string, body: unknown): Promise<T> {
+  const payload = Buffer.from(JSON.stringify(body), "utf8");
+
+  const response = await coap.request(
+    `${COAP_BASE_URL}${path}`,
+    "post",
+    payload,
+    { keepAlive: false },
+  );
+
+  if (!response.payload) {
+    throw new Error(`Resposta CoAP buida a POST ${path}`);
+  }
+
+  return JSON.parse(response.payload.toString("utf8")) as T;
+}
+
 const main = async () => {
   try {
-    // 1. Obtenir la clau pública del servidor
-    const pubKeyResponse = await fetch(`${BLIND_SERVER_URL}/pubKey`);
-
-    if (!pubKeyResponse.ok) {
-      throw new Error("No s'ha pogut obtenir la clau pública.");
-    }
-
-    const pubKeyData = await pubKeyResponse.json();
+    // 1. Obtenir la clau pública del servidor via CoAP proxy
+    const pubKeyData = await coapGetJson<{ n: string; e: string }>("/pubKey");
 
     const publicKey = new RsaPublicKey(
       BigInt(pubKeyData.n),
-      BigInt(pubKeyData.e)
+      BigInt(pubKeyData.e),
     );
 
-    console.log("Clau pública rebuda correctament.");
+    console.log("Clau pública rebuda correctament via CoAP.");
 
     // 2. Missatge que el client vol que el servidor signi
     const originalMessage = "Aquest és el meu missatge secret";
@@ -56,27 +89,18 @@ const main = async () => {
     // 5. Ceguem el missatge:
     // blindedMessage = m * r^e mod n
     const rPowE = modPow(r, publicKey.e, publicKey.n);
-    const blindedMessage =
-      (messageHash * rPowE) % publicKey.n;
+    const blindedMessage = (messageHash * rPowE) % publicKey.n;
 
     console.log("Missatge cegat:", blindedMessage.toString());
 
-    // 6. Enviem el missatge cegat al servidor perquè el signi
-    const blindSignResponse = await fetch(`${BLIND_SERVER_URL}/blind-sign`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    // 6. Enviem el missatge cegat al servidor via CoAP proxy
+    const blindSignData = await coapPostJson<{ blindSignature: string }>(
+      "/blind-sign",
+      {
         blindedMessage: blindedMessage.toString(),
-      }),
-    });
+      },
+    );
 
-    if (!blindSignResponse.ok) {
-      throw new Error("Error demanant la blind signature.");
-    }
-
-    const blindSignData = await blindSignResponse.json();
     const blindSignature = BigInt(blindSignData.blindSignature);
 
     console.log("Blind signature rebuda:", blindSignature.toString());
@@ -84,8 +108,7 @@ const main = async () => {
     // 7. Desceguem la signatura:
     // signature = blindSignature * r^-1 mod n
     const rInverse = modInv(r, publicKey.n);
-    const finalSignature =
-      (blindSignature * rInverse) % publicKey.n;
+    const finalSignature = (blindSignature * rInverse) % publicKey.n;
 
     console.log("Signatura final descegada:", finalSignature.toString());
 
@@ -95,7 +118,7 @@ const main = async () => {
 
     console.log(
       "Hash recuperat de la signatura:",
-      verifiedMessageHash.toString()
+      verifiedMessageHash.toString(),
     );
 
     const isValid = verifiedMessageHash === messageHash;
@@ -103,6 +126,8 @@ const main = async () => {
     console.log("Signatura vàlida?", isValid);
   } catch (error) {
     console.error("Error al client de blind signatures:", error);
+  } finally {
+    coap.reset();
   }
 };
 
